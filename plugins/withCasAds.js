@@ -4,10 +4,12 @@ const {
   withSettingsGradle,
   withInfoPlist,
   withDangerousMod,
+  withXcodeProject,
   createRunOncePlugin,
 } = require('@expo/config-plugins');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const CAS_VERSION = '4.6.0';
 
@@ -221,17 +223,135 @@ function withCasIosPodfile(config, props) {
 }
 
 // ─── iOS: Info.plist ────────────────────────────────────────────────────────
-// Add App Tracking Transparency usage description (required for IDFA)
+// Uses withInfoPlist (Expo's managed base mod) so changes are applied in the
+// final plist write and not overwritten. casconfig.rb (dangerous mod) runs
+// first and adds SKAdNetworkItems to disk; the base mod reads those, then
+// our callback adds the remaining keys. The ATS warning from casconfig.rb
+// is harmless — this callback sets it correctly in the final output.
 function withCasInfoPlist(config, props) {
   return withInfoPlist(config, (config) => {
-    if (!config.modResults.NSUserTrackingUsageDescription) {
-      config.modResults.NSUserTrackingUsageDescription =
+    const plist = config.modResults;
+
+    // NSUserTrackingUsageDescription (required for IDFA)
+    if (!plist.NSUserTrackingUsageDescription) {
+      plist.NSUserTrackingUsageDescription =
         props.trackingDescription ||
         'Your data will remain confidential and will only be used to provide you a better and personalised ad experience.';
     }
-    config.modResults.SKAdNetworkItems = config.modResults.SKAdNetworkItems || [];
+
+    // NSAppTransportSecurity - allow cleartext HTTP for ad networks
+    if (!plist.NSAppTransportSecurity || !plist.NSAppTransportSecurity.NSAllowsArbitraryLoads) {
+      plist.NSAppTransportSecurity = {
+        ...(plist.NSAppTransportSecurity || {}),
+        NSAllowsArbitraryLoads: true,
+      };
+    }
+
+    // GADApplicationIdentifier - required when using Google Ads adapter
+    const hasGoogleAds =
+      props.adSolution === 'optimal' ||
+      !props.adSolution ||
+      (Array.isArray(props.adapters) && props.adapters.includes('googleAds'));
+    if (hasGoogleAds && !plist.GADApplicationIdentifier) {
+      // Test ID; casconfig.rb will set the real one from CAS config when using a real CAS ID
+      plist.GADApplicationIdentifier = 'ca-app-pub-3940256099942544~1458002511';
+      plist.GADDelayAppMeasurementInit = true;
+    }
+
     return config;
   });
+}
+
+// ─── iOS: Xcode project build settings ─────────────────────────────────────
+// Ensure OTHER_LDFLAGS contains -ObjC (required by CAS SDK)
+// Note: Values in pbxproj can be quoted ("$(inherited)") or unquoted ($(inherited))
+function withCasXcodeProject(config) {
+  return withXcodeProject(config, (config) => {
+    const project = config.modResults;
+    const targets = project.pbxNativeTargetSection();
+
+    const hasFlag = (flags, flag) =>
+      flags.some((f) => f === flag || f === `"${flag}"`);
+
+    for (const key in targets) {
+      const target = targets[key];
+      if (typeof target !== 'object' || !target.buildConfigurationList) continue;
+
+      const configList = project.pbxXCConfigurationList()[target.buildConfigurationList];
+      if (!configList) continue;
+
+      for (const buildConfig of configList.buildConfigurations) {
+        const cfg = project.pbxXCBuildConfigurationSection()[buildConfig.value];
+        if (!cfg || !cfg.buildSettings) continue;
+
+        let flags = cfg.buildSettings.OTHER_LDFLAGS || [];
+        if (typeof flags === 'string') flags = [flags];
+
+        let modified = false;
+        if (!hasFlag(flags, '$(inherited)')) {
+          flags.unshift('"$(inherited)"');
+          modified = true;
+        }
+        if (!hasFlag(flags, '-ObjC')) {
+          flags.push('"-ObjC"');
+          modified = true;
+        }
+        if (modified) {
+          cfg.buildSettings.OTHER_LDFLAGS = flags;
+        }
+      }
+    }
+
+    return config;
+  });
+}
+
+// ─── iOS: Run casconfig.rb ─────────────────────────────────────────────────
+// Copy casconfig.rb from plugins/ to ios/ and run it with the CAS ID
+// This fetches SKAdNetwork IDs, downloads cas_settings.json, and updates the Xcode project
+function withCasConfigScript(config, props) {
+  return withDangerousMod(config, [
+    'ios',
+    async (config) => {
+      const casId = props.casId || 'demo';
+      const iosDir = config.modRequest.platformProjectRoot;
+      // eslint-disable-next-line no-undef -- Node.js CJS global
+      const scriptSrc = path.join(__dirname, 'casconfig.rb');
+      const scriptDst = path.join(iosDir, 'casconfig.rb');
+
+      // Copy casconfig.rb from plugins/ to ios/
+      if (!fs.existsSync(scriptSrc)) {
+        console.warn('[CAS] casconfig.rb not found in plugins/ directory, skipping iOS config script');
+        return config;
+      }
+      fs.copyFileSync(scriptSrc, scriptDst);
+
+      // Build the command arguments
+      const args = [casId];
+      const hasGoogleAds =
+        props.adSolution === 'optimal' ||
+        !props.adSolution ||
+        (Array.isArray(props.adapters) && props.adapters.includes('googleAds'));
+      if (!hasGoogleAds) {
+        args.push('--no-gad');
+      }
+
+      try {
+        console.log(`[CAS] Running casconfig.rb with CAS ID: ${casId}`);
+        execSync(`ruby casconfig.rb ${args.join(' ')}`, {
+          cwd: iosDir,
+          stdio: 'inherit',
+        });
+        console.log('[CAS] casconfig.rb completed successfully');
+      } catch (error) {
+        console.warn(`[CAS] casconfig.rb failed: ${error.message}`);
+        console.warn('[CAS] Make sure the xcodeproj gem is installed: gem install xcodeproj');
+        console.warn('[CAS] Continuing with plugin-only configuration...');
+      }
+
+      return config;
+    },
+  ]);
 }
 
 // ─── Main plugin ────────────────────────────────────────────────────────────
@@ -242,8 +362,12 @@ function withCasAds(config, props = {}) {
   config = withCasAppBuildGradle(config, props);
 
   // iOS
+  // Order matters: dangerous mods (Podfile, casconfig.rb) run first and write to disk.
+  // Then base mods (InfoPlist, XcodeProject) read the updated files and apply final changes.
   config = withCasIosPodfile(config, props);
+  config = withCasConfigScript(config, props);
   config = withCasInfoPlist(config, props);
+  config = withCasXcodeProject(config);
 
   return config;
 }

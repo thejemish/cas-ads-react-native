@@ -16,6 +16,7 @@
       [
         "./plugins/withCasAds",
         {
+          "casId": "demo",
           "adSolution": "choice",
           "useAdvertisingId": true,
           "trackingDescription": "Your data will remain confidential and will only be used to provide you a better and personalised ad experience.",
